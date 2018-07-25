@@ -10,8 +10,10 @@ from ...propagation.http import HTTPPropagator
 from ...pin import Pin
 from ...ext import http as ext_http
 from ..httplib.patch import should_skip_request
-import aiohttp
+
+import aiohttp.tracing
 from yarl import URL
+from distutils.version import LooseVersion
 
 try:
     # instrument external packages only if they're available
@@ -296,6 +298,57 @@ def _wrap_clientsession_init(trace_headers, func, instance, args, kwargs):
     return func(*args, **kwargs)
 
 
+async def _on_request_start(session, trace_config_ctx, params):
+    trace_config_ctx.url = params.url
+
+
+async def _on_request_end(session, trace_config_ctx, params):
+    pass
+
+
+async def _on_request_exception(session, trace_config_ctx, params):
+    pass
+
+
+def _wrap_clientsession_3x_init(trace_headers, enable_distributed, func, instance, args, kwargs):
+    # Use any attached tracer if available, otherwise use the global tracer
+    pin = Pin.get_from(instance)
+
+    # bail on the tracing if not enabled.
+    if not pin.tracer.enabled:
+        return func(*args, **kwargs)
+
+    # NOTE: each request will get a new TraceContext
+    class TraceContext(aiohttp.tracing.SimpleNamespace):
+        @property
+        def trace_headers(self):
+            return trace_headers
+
+        @property
+        def enable_distributed(self):
+            return enable_distributed
+
+    assert not args  # 3.x does not support positional arguments
+    trace_config = aiohttp.TraceConfig(TraceContext)
+
+    trace_config.on_request_start.append(_on_request_start)
+    trace_config.on_request_end.append(_on_request_start)
+    trace_config.on_request_exception.append(_on_request_exception)
+
+    trace_configs = list(kwargs.get('trace_configs', []))
+    trace_configs.append(trace_config)
+
+    # copy so we don't change caller's version
+    kwargs['trace_configs'] = trace_configs
+
+    return func(*args, **kwargs)
+
+
+_2x_wrapped_methods = {
+    'get', 'options', 'head', 'post', 'put', 'patch', 'delete', 'request'
+}
+
+
 def patch(tracer=None, enable_distributed=False, trace_headers=None,
           trace_context=False):
     """
@@ -317,16 +370,18 @@ def patch(tracer=None, enable_distributed=False, trace_headers=None,
                   app_type=ext_http.TYPE, tracer=tracer)
         pin.onto(aiohttp.ClientSession)
 
-        wrapper = functools.partial(_wrap_clientsession_init, trace_headers)
-        _w('aiohttp', 'ClientSession.__init__', wrapper)
+        if LooseVersion(aiohttp.__version__) < LooseVersion('3.0.0'):
+            wrapper = functools.partial(_wrap_clientsession_init, trace_headers)
+            _w('aiohttp', 'ClientSession.__init__', wrapper)
 
-        for method in \
-                {'get', 'options', 'head', 'post', 'put', 'patch', 'delete',
-                 'request'}:
-            wrapper = functools.partial(_create_wrapped_request,
-                                        method.upper(), enable_distributed,
-                                        trace_headers, trace_context)
-            _w('aiohttp', 'ClientSession.{}'.format(method), wrapper)
+            for method in _2x_wrapped_methods:
+                wrapper = functools.partial(_create_wrapped_request,
+                                            method.upper(), enable_distributed,
+                                            trace_headers, trace_context)
+                _w('aiohttp', 'ClientSession.{}'.format(method), wrapper)
+        else:
+            wrapper = functools.partial(_wrap_clientsession_3x_init, trace_headers, enable_distributed)
+            _w('aiohttp', 'ClientSession.__init__', wrapper)
 
     if _trace_render_template and \
             not getattr(aiohttp_jinja2, '__datadog_patch', False):
@@ -343,7 +398,10 @@ def unpatch():
     """
     if getattr(aiohttp, '__datadog_patch', False):
         unwrap(aiohttp.ClientSession, '__init__')
-        unwrap(aiohttp.ClientSession, '_request')
+
+        if LooseVersion(aiohttp.__version__) < LooseVersion('3.0.0'):
+            for method in _2x_wrapped_methods:
+                unwrap(aiohttp.ClientSession, method)
 
     if _trace_render_template and getattr(aiohttp_jinja2, '__datadog_patch',
                                           False):
