@@ -9,6 +9,7 @@ from ddtrace.contrib.aiopg.patch import unpatch
 from tests.contrib.asyncio.utils import AsyncioTestCase
 from tests.contrib.asyncio.utils import mark_asyncio
 from tests.contrib.config import POSTGRES_CONFIG
+from ..test import ConnCtx
 
 
 TEST_PORT = str(POSTGRES_CONFIG["port"])
@@ -20,42 +21,52 @@ class TestPsycopgPatch(AsyncioTestCase):
 
     def setUp(self):
         super().setUp()
-        self._conn = None
         patch()
 
     def tearDown(self):
         super().tearDown()
-        if self._conn and not self._conn.closed:
-            self._conn.close()
-
         unpatch()
 
-    @asyncio.coroutine
-    def _get_conn_and_tracer(self):
-        conn = self._conn = yield from aiopg.connect(**POSTGRES_CONFIG)
-        Pin.get_from(conn).clone(tracer=self.tracer).onto(conn)
+    def _get_conn(self):
+        Pin(None, tracer=self.tracer).onto(aiopg)
+        return ConnCtx(None)
 
-        return conn, self.tracer
+    @mark_asyncio
+    async def test_cursor_ctx_manager(self):
+        # ensure cursors work with context managers
+        # https://github.com/DataDog/dd-trace-py/issues/228
 
-    async def _test_cursor_ctx_manager(self):
-        conn, tracer = await self._get_conn_and_tracer()
-        cur = await conn.cursor()
-        t = type(cur)
+        async with self._get_conn() as conn:
+            async with conn.cursor() as cur:
+                t = type(cur)
 
-        async with conn.cursor() as cur:
+            async with conn.cursor() as cur:
             assert t == type(cur), "%s != %s" % (t, type(cur))
-            await cur.execute(query="select 'blah'")
-            rows = await cur.fetchall()
-            assert len(rows) == 1
+            await cur.execute(operation="select 'blah'")
+                rows = await cur.fetchall()
+                assert len(rows) == 1
             assert rows[0][0] == "blah"
 
         spans = self.pop_spans()
-        assert len(spans) == 1
-        span = spans[0]
-        assert span.name == "postgres.query"
+        assert len(spans) == 3
+        assert spans[0].name == "postgres.connect"
+        assert spans[1].name == "postgres.execute"
+        assert spans[2].name == "postgres.fetchall"
 
     @mark_asyncio
-    def test_cursor_ctx_manager(self):
-        # ensure cursors work with context managers
-        # https://github.com/DataDog/dd-trace-py/issues/228
-        yield from self._test_cursor_ctx_manager()
+    async def test_pool(self):
+        Pin(None, tracer=self.tracer).onto(aiopg)
+
+        async with aiopg.create_pool(**POSTGRES_CONFIG,
+                                     minsize=1, maxsize=1) as pool:
+            async with pool.acquire() as conn:
+                async with conn.cursor() as cur:
+                    await cur.execute('select 1;')
+
+        spans = self.pop_spans()
+        assert len(spans) == 4
+
+        assert spans[0].name == "postgres.connect"
+        assert spans[1].name == "postgres.pool.acquire"
+        assert spans[2].name == "postgres.execute"
+        assert spans[3].name == "postgres.pool.release"

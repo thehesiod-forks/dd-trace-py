@@ -265,7 +265,7 @@ cdef class MsgpackStringTable(StringTable):
         cdef stdint.uint32_t l = self._next_id
         cdef int offset = MSGPACK_STRING_TABLE_LENGTH_PREFIX_SIZE - array_prefix_size(l)
         cdef int old_pos = self.pk.length
-        
+
         with self._lock:
             # Update table size prefix
             self.pk.length = offset
@@ -278,7 +278,7 @@ cdef class MsgpackStringTable(StringTable):
             if ret:
                 return None
             self.pk.length = old_pos
-        
+
         return PyBytes_FromStringAndSize(self.pk.buf + offset, self.pk.length - offset)
 
     @property
@@ -707,23 +707,23 @@ cdef class MsgpackEncoderV05(MsgpackEncoderBase):
         _ = span.trace_id
         ret = msgpack_pack_uint64(&self.pk, _ if _ is not None else 0)
         if ret != 0: return ret
-        
+
         _ = span.span_id
         ret = msgpack_pack_uint64(&self.pk, _ if _ is not None else 0)
         if ret != 0: return ret
-        
+
         _ = span.parent_id
         ret = msgpack_pack_uint64(&self.pk, _ if _ is not None else 0)
         if ret != 0: return ret
-        
+
         _ = span.start_ns
         ret = msgpack_pack_int64(&self.pk, _ if _ is not None else 0)
         if ret != 0: return ret
-        
+
         _ = span.duration_ns
         ret = msgpack_pack_int64(&self.pk, _ if _ is not None else 0)
         if ret != 0: return ret
-        
+
         _ = span.error
         ret = msgpack_pack_int32(&self.pk, _ if _ is not None else 0)
         if ret != 0: return ret
@@ -741,7 +741,7 @@ cdef class MsgpackEncoderV05(MsgpackEncoderBase):
             if ret != 0: return ret
             ret = msgpack_pack_uint32(&self.pk, <stdint.uint32_t> dd_origin)
             if ret != 0: return ret
-        
+
         ret = msgpack_pack_map(&self.pk, len(span._metrics))
         if ret != 0: return ret
         if span._metrics:
@@ -834,7 +834,7 @@ cdef class Packer(object):
                         continue
                     else:
                         raise OverflowError("Integer value out of range")
-            elif PyInt_CheckExact(o):
+            elif PyInt_Check(o):
                 longval = o
                 ret = msgpack_pack_long(&self.pk, longval)
             elif PyFloat_CheckExact(o):
@@ -848,7 +848,7 @@ cdef class Packer(object):
                 ret = msgpack_pack_bin(&self.pk, L)
                 if ret == 0:
                     ret = msgpack_pack_raw_body(&self.pk, rawval, L)
-            elif PyUnicode_CheckExact(o):
+            elif PyUnicode_Check(o):
                 if self.encoding == NULL:
                     ret = msgpack_pack_unicode(&self.pk, o, ITEM_LIMIT)
                     if ret == -2:

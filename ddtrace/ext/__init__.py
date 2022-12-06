@@ -1,4 +1,12 @@
-class SpanTypes(object):
+from enum import Enum, unique
+
+
+class StrEnum(str, Enum):
+    pass
+
+
+@unique
+class SpanTypes(StrEnum):
     CACHE = "cache"
     CASSANDRA = "cassandra"
     ELASTICSEARCH = "elasticsearch"

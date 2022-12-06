@@ -4,25 +4,21 @@ from ddtrace import Pin
 from ddtrace import config
 from ddtrace.vendor import wrapt
 
-from ...constants import SPAN_MEASURED_KEY
-from ...ext import SpanTypes
+import inspect
+import warnings
+
+# 3p
+from asyncpg.protocol import Protocol as orig_Protocol
+import asyncpg.protocol
+import asyncpg.connect_utils
+import asyncpg.pool
+
 from ...ext import db
 from ...ext import net
-from ...internal.logger import get_logger
-from ...internal.utils import get_argument_value
-from ..trace_utils import ext_service
-from ..trace_utils import unwrap
-from ..trace_utils import wrap
-from ..trace_utils_async import with_traced_module
-
-
-if TYPE_CHECKING:  # pragma: no cover
-    from types import ModuleType
-    from typing import Dict
-    from typing import Union
-
-    import asyncpg
-    from asyncpg.prepared_stmt import PreparedStatement
+from ddtrace.pin import Pin
+from .connection import AIOTracedProtocol
+from ...utils.wrappers import unwrap as _u
+from ...ext import sql
 
 
 config._add(
@@ -33,103 +29,190 @@ config._add(
 )
 
 
-log = get_logger(__name__)
+def _create_pin(tags):
+    # Will propagate info from global pin
+    pin = Pin.get_from(asyncpg)
+    db_name = tags.get(db.NAME)
+    service = pin.service if pin and pin.service else "postgres_%s" % db_name if db_name else "postgres"
+    app = pin.app if pin and pin.app else "postgres"
+    tracer = pin.tracer if pin else None
+
+    if pin and pin.tags:
+        tags = {**tags, **pin.tags}  # noqa: E999
+
+    return Pin(service=service, app=app, app_type=sql.APP_TYPE, tags=tags, tracer=tracer)
 
 
-def _get_connection_tags(conn):
-    # type: (asyncpg.Connection) -> Dict[str, str]
-    addr = conn._addr
-    params = conn._params
-    host = port = ""
-    if isinstance(addr, tuple) and len(addr) == 2:
-        host, port = addr
-    return {
-        net.TARGET_HOST: host,
-        net.TARGET_PORT: port,
-        db.USER: params.user,
-        db.NAME: params.database,
+def protocol_factory(protocol_cls, *args, **kwargs):
+    def unwrapped(addr, connected_fut, con_params, *uargs, **ukwargs):
+        proto = protocol_cls(addr, connected_fut, con_params, *uargs, **ukwargs)  # noqa: E999
+
+        tags = {
+            net.TARGET_HOST: addr[0],
+            net.TARGET_PORT: addr[1],
+            db.NAME: con_params.database,
+            db.USER: con_params.user,
+            # "db.application" : dsn.get("application_name"),
+        }
+
+        pin = _create_pin(tags)
+
+        if not pin.tracer.enabled:
+            return proto
+
+        return AIOTracedProtocol(proto, pin)
+
+    return unwrapped
+
+
+async def _patched_connect(connect_func, _, args, kwargs):
+    assert connect_func != _patched_connect
+
+    tags = {
+        net.TARGET_HOST: kwargs["addr"][0],
+        net.TARGET_PORT: kwargs["addr"][1],
+        db.NAME: kwargs["params"].database,
+        db.USER: kwargs["params"].user,
+        # "db.application" : dsn.get("application_name"),
     }
 
+    pin = _create_pin(tags)
 
-class _TracedConnection(wrapt.ObjectProxy):
-    def __init__(self, conn, pin):
-        super(_TracedConnection, self).__init__(conn)
-        conn_pin = pin.clone(tags=_get_connection_tags(conn))
-        # Keep the pin on the protocol
-        conn_pin.onto(self._protocol)
-
-    def __setddpin__(self, pin):
-        pin.onto(self._protocol)
-
-    def __getddpin__(self):
-        return Pin.get_from(self._protocol)
-
-
-@with_traced_module
-async def _traced_connect(asyncpg, pin, func, instance, args, kwargs):
-    """Traced asyncpg.connect().
-
-    connect() is instrumented and patched to return a connection proxy.
-    """
-    with pin.tracer.trace(
-        "postgres.connect", span_type=SpanTypes.SQL, service=ext_service(pin, config.asyncpg)
-    ) as span:
-        # Need an ObjectProxy since Connection uses slots
-        conn = _TracedConnection(await func(*args, **kwargs), pin)
-        span.set_tags(_get_connection_tags(conn))
+    if not pin.tracer.enabled:
+        conn = await connect_func(*args, **kwargs)
         return conn
 
+    with pin.tracer.trace((pin.app or "sql") + ".connect", service=pin.service) as s:
+        s.span_type = sql.TYPE
+        s.set_tags(pin.tags)
 
-async def _traced_query(pin, method, query, args, kwargs):
-    with pin.tracer.trace(
-        "postgres.query", resource=query, service=ext_service(pin, config.asyncpg), span_type=SpanTypes.SQL
-    ) as span:
-        span.set_tag(SPAN_MEASURED_KEY)
-        span.set_tags(pin.tags)
-        return await method(*args, **kwargs)
+        conn = await connect_func(*args, **kwargs)
 
-
-@with_traced_module
-async def _traced_protocol_execute(asyncpg, pin, func, instance, args, kwargs):
-    state = get_argument_value(args, kwargs, 0, "state")  # type: Union[str, PreparedStatement]
-    query = state if isinstance(state, str) else state.query
-    return await _traced_query(pin, func, query, args, kwargs)
+    # NOTE: we can't pin anything to the connection object as it's closed
+    return conn
 
 
-def _patch(asyncpg):
-    # type: (ModuleType) -> None
-    wrap(asyncpg, "connect", _traced_connect(asyncpg))
-    for method in ("execute", "bind_execute", "query", "bind_execute_many"):
-        wrap(asyncpg.protocol, "Protocol.%s" % method, _traced_protocol_execute(asyncpg))
+_connect_args = inspect.signature(asyncpg.connection.connect).parameters
+_parse_connect_dsn_and_args_params = inspect.signature(asyncpg.connect_utils._parse_connect_dsn_and_args).parameters
+
+_connect_parse_arg_mapping = {"connect_timeout": "timeout"}
+
+
+def _get_parsed_tags(**connect_kwargs):
+    parse_args = dict()
+
+    for param_name, param in _parse_connect_dsn_and_args_params.items():
+        # Grab param from connect_kwargs
+        connect_param_name = _connect_parse_arg_mapping.get(param_name, param_name)
+        default = _connect_args[connect_param_name].default
+        parse_args[param_name] = connect_kwargs.get(param_name, default)
+
+    try:
+        addrs, params, *_ = asyncpg.connect_utils._parse_connect_dsn_and_args(**parse_args)
+
+        tags = {
+            net.TARGET_HOST: addrs[0][0],
+            net.TARGET_PORT: addrs[0][1],
+            db.NAME: params.database,
+            db.USER: params.user,
+        }
+        return tags
+    except Exception:
+        # This same exception will presumably be raised during the actual conn
+        return {}
+
+
+async def _patched_acquire(acquire_func, instance, args, kwargs):
+    if instance._working_addr:
+        tags = {
+            net.TARGET_HOST: instance._working_addr[0],
+            net.TARGET_PORT: instance._working_addr[1],
+            db.NAME: instance._working_params.database,
+            db.USER: instance._working_params.user,
+            # "db.application" : dsn.get("application_name"),
+        }
+    else:
+        conn = instance._queue._queue[0]
+        if hasattr(conn, "_connect_kwargs"):
+            kwargs_copy = dict(conn._connect_kwargs)
+            connect_args = conn._connect_args
+        else:
+            # this later got moved to the instance
+            kwargs_copy = dict(instance._connect_kwargs)
+            connect_args = instance._connect_args
+
+        tags = {}
+        if len(connect_args) == 1:
+            kwargs_copy["dsn"] = connect_args[0]
+            tags = _get_parsed_tags(**kwargs_copy)
+        else:
+            warnings.warn("Unrecognized parameters to asyncpg connect")
+
+    pin = _create_pin(tags)
+
+    if not pin.tracer.enabled:
+        conn = await acquire_func(*args, **kwargs)
+        return conn
+
+    with pin.tracer.trace((pin.app or "sql") + ".pool.acquire", service=pin.service) as s:
+        s.span_type = sql.TYPE
+        s.set_tags(pin.tags)
+        conn = await acquire_func(*args, **kwargs)
+
+    return conn
+
+
+async def _patched_release(release_func, instance, args, kwargs):
+    tags = {
+        net.TARGET_HOST: instance._working_addr[0],
+        net.TARGET_PORT: instance._working_addr[1],
+        db.NAME: instance._working_params.database,
+        db.USER: instance._working_params.user,
+        # "db.application" : dsn.get("application_name"),
+    }
+
+    pin = _create_pin(tags)
+
+    if not pin.tracer.enabled:
+        conn = await release_func(*args, **kwargs)
+        return conn
+
+    with pin.tracer.trace((pin.app or "sql") + ".pool.release", service=pin.service) as s:
+        s.span_type = sql.TYPE
+        s.set_tags(pin.tags)
+
+        conn = await release_func(*args, **kwargs)
+
+    return conn
 
 
 def patch():
-    # type: () -> None
-    import asyncpg
-
+    """ Patch monkey patches various items in asyncpg so that the requests
+    will be traced
+    """
     if getattr(asyncpg, "_datadog_patch", False):
         return
-
-    Pin().onto(asyncpg)
-    _patch(asyncpg)
-
     setattr(asyncpg, "_datadog_patch", True)
 
+    wrapt.wrap_object(asyncpg.protocol, "Protocol", protocol_factory)
 
-def _unpatch(asyncpg):
-    # type: (ModuleType) -> None
-    unwrap(asyncpg, "connect")
-    for method in ("execute", "bind_execute", "query", "bind_execute_many"):
-        unwrap(asyncpg.protocol.Protocol, method)
+    # we use _connect_addr to avoid having to parse the dsn and it gets called
+    # once per address (there can be multiple)
+    wrapt.wrap_function_wrapper(asyncpg.connect_utils, "_connect_addr", _patched_connect)
+
+    # tracing acquire since it may block waiting for a connection from the pool
+    wrapt.wrap_function_wrapper(asyncpg.pool.Pool, "_acquire", _patched_acquire)
+
+    # tracing release to match acquire
+    wrapt.wrap_function_wrapper(asyncpg.pool.Pool, "release", _patched_release)
 
 
 def unpatch():
-    # type: () -> None
-    import asyncpg
+    if getattr(asyncpg, "_datadog_patch", False):
+        setattr(asyncpg, "_datadog_patch", False)
+        _u(asyncpg.connect_utils, "_connect_addr")
+        _u(asyncpg.pool.Pool, "_acquire")
+        _u(asyncpg.pool.Pool, "release")
 
-    if not getattr(asyncpg, "_datadog_patch", False):
-        return
-
-    _unpatch(asyncpg)
-
-    setattr(asyncpg, "_datadog_patch", False)
+        # we can't use unwrap because wrapt does a simple attribute replacement
+        asyncpg.protocol.Protocol = orig_Protocol

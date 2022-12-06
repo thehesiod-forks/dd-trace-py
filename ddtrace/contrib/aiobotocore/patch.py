@@ -25,6 +25,7 @@ if AIOBOTOCORE_VERSION <= (0, 10, 0):
     from aiobotocore.endpoint import ClientResponseContentProxy
 elif AIOBOTOCORE_VERSION >= (0, 11, 0) and AIOBOTOCORE_VERSION < (2, 3, 0):
     from aiobotocore._endpoint_helpers import ClientResponseContentProxy
+from ..aiohttp.patch import ENABLE_DISTRIBUTED_ATTR_NAME
 
 
 ARGS_NAME = ("action", "params", "path", "verb")
@@ -86,6 +87,14 @@ async def _wrapped_api_call(original_func, instance, args, kwargs):
     if not pin or not pin.enabled():
         result = await original_func(*args, **kwargs)
         return result
+
+    # we can't enable aiohttp distributed tracing for aiobotocore's
+    # aiohttp session as it would inject headers into the API calls
+    aio_session = deep_getattr(instance, "_endpoint._aio_session")
+    if not aio_session:
+        aio_session = deep_getattr(instance, "_endpoint.http_session")
+    if not hasattr(aio_session, ENABLE_DISTRIBUTED_ATTR_NAME):
+        setattr(aio_session, ENABLE_DISTRIBUTED_ATTR_NAME, False)
 
     endpoint_name = deep_getattr(instance, "_endpoint._endpoint_prefix")
 

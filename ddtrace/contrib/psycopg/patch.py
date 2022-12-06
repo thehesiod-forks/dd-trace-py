@@ -13,7 +13,7 @@ from ddtrace.ext import db
 from ddtrace.ext import net
 from ddtrace.ext import sql
 from ddtrace.vendor import wrapt
-
+from ...utils.wrappers import unwrap as _u
 from ...internal.utils.formats import asbool
 from ...internal.utils.version import parse_version
 
@@ -28,8 +28,6 @@ config._add(
     ),
 )
 
-# Original connect method
-_connect = psycopg2.connect
 
 PSYCOPG2_VERSION = parse_version(psycopg2.__version__)
 
@@ -50,7 +48,7 @@ def patch():
 def unpatch():
     if getattr(psycopg2, "_datadog_patch", False):
         setattr(psycopg2, "_datadog_patch", False)
-        psycopg2.connect = _connect
+        _u(psycopg2, "connect")
         _unpatch_extensions(_psycopg2_extensions)
 
         pin = Pin.get_from(psycopg2)
@@ -111,7 +109,8 @@ def _patch_extensions(_extensions):
     # we must patch extensions all the time (it's pretty harmless) so split
     # from global patching of connections. must be idempotent.
     for _, module, func, wrapper in _extensions:
-        if not hasattr(module, func) or isinstance(getattr(module, func), wrapt.ObjectProxy):
+        if not hasattr(module, func) or \
+                isinstance(getattr(module, func), wrapt.ObjectProxy):
             continue
         wrapt.wrap_function_wrapper(module, func, wrapper)
 

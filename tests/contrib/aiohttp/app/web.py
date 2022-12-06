@@ -1,5 +1,6 @@
 import asyncio
 import os
+import functools
 
 from aiohttp import web
 
@@ -11,6 +12,7 @@ except ImportError:
 else:
     import jinja2
 
+from ddtrace.contrib.aiohttp.middlewares import middleware, AIOHTTP_HAS_MIDDLEWARE
 from ddtrace.contrib.aiohttp.middlewares import CONFIG_KEY
 
 
@@ -27,7 +29,6 @@ async def name(request):
     name = request.match_info.get("name", "Anonymous")
     return web.Response(text="Hello {}".format(name))
 
-
 async def response_headers(request):
     response = web.Response(text="response_headers_test")
     response.headers["my-response-header"] = "my_response_value"
@@ -42,7 +43,7 @@ async def coroutine_chaining(request):
     return web.Response(text=text)
 
 
-def route_exception(request):
+async def route_exception(request):
     raise Exception("error")
 
 
@@ -85,16 +86,21 @@ async def coro_2(request):
 
 async def delayed_handler(request):
     await asyncio.sleep(0.01)
-    return web.Response(text="Done")
+    return web.Response(text='Done')
 
 
-async def noop_middleware(app, handler):
-    async def middleware_handler(request):
-        # noop middleware
-        response = await handler(request)
-        return response
+@middleware
+async def noop_middleware_2x(request, handler):
+    # noop middleware
+    response = await handler(request)
+    return response
 
-    return middleware_handler
+
+async def noop_middleware_1x(app, handler):
+    return functools.partial(noop_middleware_2x, handler=handler)
+
+
+noop_middleware = noop_middleware_2x if AIOHTTP_HAS_MIDDLEWARE else noop_middleware_1x
 
 
 if aiohttp_jinja2:

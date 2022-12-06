@@ -19,7 +19,7 @@ async def test_full_request(patched_app_tracer, aiohttp_client, loop):
     # with the proper tags
     request = await client.request("GET", "/")
     assert 200 == request.status
-    await request.text()
+        await request.text()
     # the trace is created
     traces = tracer.pop_traces()
     assert 1 == len(traces)
@@ -54,7 +54,7 @@ async def test_multiple_full_request(patched_app_tracer, aiohttp_client, loop):
 
     # yield back to the event loop until all requests are processed
     while len(responses) < NUMBER_REQUESTS:
-        await asyncio.sleep(0.001)
+            await asyncio.sleep(0.001)
 
     for response in responses:
         assert "Done" == response
