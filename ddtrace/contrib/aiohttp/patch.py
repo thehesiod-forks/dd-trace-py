@@ -1,20 +1,26 @@
 import functools
-import logging
-
-from ddtrace import config
-from ddtrace.vendor import wrapt
-from ddtrace.internal.logger import get_logger
-
-from ...utils.wrappers import get_root_wrapped
-from ...propagation.http import HTTPPropagator
-from ...pin import Pin
-from ...ext import http as ext_http
-from ..httplib.patch import should_skip_request
-from ..trace_utils import unwrap
-from ..trace_utils import wrap
-
+import os
+from typing import Union
 from yarl import URL
 
+from ddtrace import config, Span
+from ddtrace.internal.logger import get_logger
+from ddtrace.internal.utils import get_argument_value
+from ddtrace.internal.utils.formats import asbool
+from ddtrace.vendor import wrapt
+
+from ...ext import SpanTypes
+from ...internal.compat import parse
+from ...pin import Pin
+from ...propagation.http import HTTPPropagator
+from ..trace_utils import ext_service
+from ..trace_utils import set_http_meta
+from ..trace_utils import unwrap
+from ..trace_utils import with_traced_module as with_traced_module_sync
+from ..trace_utils import wrap
+from ..trace_utils_async import with_traced_module
+
+import aiohttp
 
 log = get_logger(__name__)
 
@@ -29,6 +35,8 @@ config._add(
     dict(
         distributed_tracing=asbool(os.getenv("DD_AIOHTTP_CLIENT_DISTRIBUTED_TRACING", True)),
         default_http_tag_query_string=os.getenv("DD_HTTP_CLIENT_TAG_QUERY_STRING", "true"),
+        # todo: remove this later it seems like we have to use config._obfuscation_query_string_pattern
+        # in our usage only commodities will use it
         redact_query_keys=set(),
 
     ),
@@ -40,7 +48,7 @@ ENABLE_DISTRIBUTED_ATTR_NAME = '_dd_enable_distributed'
 TRACE_HEADERS_ATTR_NAME = '_dd_trace_headers'
 
 
-def _set_request_tags(span: Span, req: Union[ClientRequest, ClientResponse]):
+def _set_request_tags(span: Span, req: Union[aiohttp.ClientRequest, aiohttp.ClientResponse]):
     url_str = str(req.url)
     parsed_url = parse.urlparse(url_str)
 
@@ -63,7 +71,7 @@ class _WrappedConnectorClass(wrapt.ObjectProxy):
     async def connect(self, req, *args, **kwargs):
         pin = Pin.get_from(self)
         with pin.tracer.trace("%s.connect" % self.__class__.__name__,
-                              span_type=ext_http.TYPE, service=pin.service) as span:
+                              span_type=SpanTypes.HTTP, service=pin.service) as span:
             _set_request_tags(span, req)
             # We call this way so "self" will not get sliced and call
             # _create_connection on us first
@@ -74,7 +82,7 @@ class _WrappedConnectorClass(wrapt.ObjectProxy):
         pin = Pin.get_from(self)
         with pin.tracer.trace(
                 "%s._create_connection" % self.__class__.__name__,
-                span_type=ext_http.TYPE, service=pin.service) as span:
+                span_type=SpanTypes.HTTP, service=pin.service) as span:
             _set_request_tags(span, req)
             result = await self.__wrapped__._create_connection(req, *args, **kwargs)
             return result
@@ -119,7 +127,7 @@ class _WrappedStreamReader(wrapt.ObjectProxy):
         pin = Pin.get_from(self)
         # This may not have an immediate parent as the request completed
         with pin.tracer.trace('{}.{}'.format(self.__class__.__name__, method_name),
-                              span_type=ext_http.TYPE, service=pin.service) as span:
+                              span_type=SpanTypes.HTTP, service=pin.service) as span:
 
             if self._self_parent_trace_id:
                 span.trace_id = self._self_parent_trace_id
@@ -159,7 +167,7 @@ class _WrappedResponseClass(wrapt.ObjectProxy):
 
         # This will parent correctly as we'll always have an enclosing span
         with pin.tracer.trace('{}.start'.format(self.__class__.__name__),
-                              span_type=ext_http.TYPE, service=pin.service) as span:
+                              span_type=SpanTypes.HTTP, service=pin.service) as span:
             _set_request_tags(span, self)
 
             wrapped = get_root_wrapped(self)
