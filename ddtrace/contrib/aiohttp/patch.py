@@ -10,6 +10,7 @@ from ddtrace.internal.utils.formats import asbool
 from ddtrace.vendor import wrapt
 
 from ...ext import SpanTypes
+from ...ext import http as ext_http
 from ...internal.compat import parse
 from ...pin import Pin
 from ...propagation.http import HTTPPropagator
@@ -19,6 +20,7 @@ from ..trace_utils import unwrap
 from ..trace_utils import with_traced_module as with_traced_module_sync
 from ..trace_utils import wrap
 from ..trace_utils_async import with_traced_module
+from ..httplib.patch import should_skip_request
 
 import aiohttp
 
@@ -35,17 +37,32 @@ config._add(
     dict(
         distributed_tracing=asbool(os.getenv("DD_AIOHTTP_CLIENT_DISTRIBUTED_TRACING", True)),
         default_http_tag_query_string=os.getenv("DD_HTTP_CLIENT_TAG_QUERY_STRING", "true"),
-        # todo: remove this later it seems like we have to use config._obfuscation_query_string_pattern
-        # in our usage only commodities will use it
+        # TODO: remove this later it seems like we have to use config._obfuscation_query_string_pattern
+        # TODO: in our usage only commodities will use it
         redact_query_keys=set(),
 
     ),
 )
 
+try:
+    import wrapt as unvendored_wrapt
+
+    _wrapt_objproxy_types = (wrapt.ObjectProxy, unvendored_wrapt.ObjectProxy)
+except ImportError:
+    _wrapt_objproxy_types = (wrapt.ObjectProxy,)
+
 # Set these on the ClientSession instance to override the settings
 # from the patch method
 ENABLE_DISTRIBUTED_ATTR_NAME = '_dd_enable_distributed'
-TRACE_HEADERS_ATTR_NAME = '_dd_trace_headers'
+# Remove TRACE_HEADERS_ATTR_NAME here we have to use DD_TRACE_HEADER_TAGS
+# TRACE_HEADERS_ATTR_NAME = '_dd_trace_headers'
+
+
+def get_root_wrapped(obj):
+    while isinstance(obj, _wrapt_objproxy_types) and hasattr(obj, "__wrapped__"):
+        obj = obj.__wrapped__
+
+    return obj
 
 
 def _set_request_tags(span: Span, req: Union[aiohttp.ClientRequest, aiohttp.ClientResponse]):
@@ -60,7 +77,6 @@ def _set_request_tags(span: Span, req: Union[aiohttp.ClientRequest, aiohttp.Clie
         query=parsed_url.query,
         request_headers=req.headers,
     )
-
 
 
 class _WrappedConnectorClass(wrapt.ObjectProxy):
@@ -145,12 +161,14 @@ class _WrappedStreamReader(wrapt.ObjectProxy):
 
 
 class _WrappedResponseClass(wrapt.ObjectProxy):
-    def __init__(self, obj, pin, trace_headers):
+    #note: here we drop `trace_headers` init parameter since we no longer need it
+    def __init__(self, obj, pin):
         super().__init__(obj)
 
         pin.onto(self)
 
         # We'll always have a parent span from outer request
+        # note: get_call_context not longer exists change it
         ctx = pin.tracer.get_call_context()
         parent_span = ctx.get_current_span()
         if parent_span:
@@ -158,8 +176,9 @@ class _WrappedResponseClass(wrapt.ObjectProxy):
             self._self_parent_span_id = parent_span.span_id
         else:
             self._self_parent_trace_id, self._self_parent_span_id = ctx.trace_id, ctx.span_id
-
-        self._self_trace_headers = trace_headers
+        # Note: remove setting  self._self_trace_headers since we no longer pass in trace_headers
+        # Note: we have to replace our calls to set `DD_TRACE_HEADER_TAGS`
+        # Note: self._self_trace_headers = trace_headers
 
     async def start(self, *args, **kwargs):
         # This will get called once per connect
@@ -168,8 +187,8 @@ class _WrappedResponseClass(wrapt.ObjectProxy):
         # This will parent correctly as we'll always have an enclosing span
         with pin.tracer.trace('{}.start'.format(self.__class__.__name__),
                               span_type=SpanTypes.HTTP, service=pin.service) as span:
+            # note: Ask Amohr does below code looks right? is self an request or ressponse?
             _set_request_tags(span, self)
-
             wrapped = get_root_wrapped(self)
             await wrapped.start(*args, **kwargs)
 
@@ -180,6 +199,11 @@ class _WrappedResponseClass(wrapt.ObjectProxy):
                 status_code=self.status,
                 status_msg=self.reason
             )
+            # Note: Ask Amohr can you check below set tag related implementation for later `pin.clone(tags=tags)` usage
+            # to see if it makes sense or not
+            tags = {}
+            for tag in {ext_http.URL, ext_http.STATUS_CODE, ext_http.METHOD}:
+                tags[tag] = span.get_tag(tag)
 
         # after start, self.__wrapped__.content is set
         pin = pin.clone(tags=tags)
@@ -216,7 +240,7 @@ async def _traced_clientsession_request(aiohttp, pin, func, instance, args, kwar
     ) as span:
         enabled_distributed = pin._config["distributed_tracing"]
         if hasattr(instance, ENABLE_DISTRIBUTED_ATTR_NAME):
-            enable_distributed |= getattr(instance, ENABLE_DISTRIBUTED_ATTR_NAME)
+            enabled_distributed |= getattr(instance, ENABLE_DISTRIBUTED_ATTR_NAME)
 
         if enabled_distributed:
             HTTPPropagator.inject(span.context, headers)
@@ -243,7 +267,7 @@ async def _traced_clientsession_request(aiohttp, pin, func, instance, args, kwar
 
 
 def _create_wrapped_response(client_session, cls, instance, args, kwargs):
-    obj = _WrappedResponseClass(cls(*args, **kwargs), Pin.get_from(client_session), trace_headers)
+    obj = _WrappedResponseClass(cls(*args, **kwargs), Pin.get_from(client_session))
     return obj
 
 
@@ -288,4 +312,4 @@ def unpatch():
 
     _unpatch_client(aiohttp)
 
-    setattr(aiohttp, "__datadog_patch", False)
+    setattr(aiohttp, "_datadog_patch", False)
