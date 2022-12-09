@@ -9,7 +9,6 @@ from ...ext import http
 from ...internal.compat import stringify
 from ..asyncio import context_provider
 from ...pin import Pin
-from ...utils.wrappers import iswrapped
 from .patch import _WrappedStreamReader
 
 try:
@@ -108,7 +107,7 @@ async def trace_middleware_2x(request, handler, app=None):
     if trace_query_string:
         request_span.set_tag(http.QUERY_STRING, request.query_string)
 
-    if not iswrapped(request._payload) and isinstance(request._payload, aiohttp.streams.StreamReader):
+    if not trace_utils.iswrapped(request._payload) and isinstance(request._payload, aiohttp.streams.StreamReader):
         tags = {
             tag: request_span.get_tag(tag)
             for tag in {http.URL, http.METHOD, http.QUERY_STRING}
@@ -158,16 +157,9 @@ async def on_prepare(request, response):
 
     request_span.set_tag(http.STATUS_CODE, response.status)
 
-    # TOOD: normally we'd do this but we want to pin the tags to the stream response via middleware
-    # trace_utils.set_http_meta(
-    #     request_span,
-    #     config.aiohttp,
-    #     method=request.method,
-    #     url=str(request.url),  # DEV: request.url is a yarl's URL object
-    #     status_code=response.status,
-    #     request_headers=request.headers,
-    #     response_headers=response.headers,
-    # )
+    # TODO: Ask Amohr should we add this?
+    if 500 <= response.status < 600:
+        request_span.error = 1
 
     request_span.finish()
 
