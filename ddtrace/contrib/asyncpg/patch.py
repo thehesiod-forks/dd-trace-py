@@ -1,5 +1,3 @@
-from typing import TYPE_CHECKING
-
 from ddtrace import Pin
 from ddtrace import config
 from ddtrace.vendor import wrapt
@@ -13,12 +11,11 @@ import asyncpg.protocol
 import asyncpg.connect_utils
 import asyncpg.pool
 
+from ...ext import SpanTypes
 from ...ext import db
 from ...ext import net
-from ddtrace.pin import Pin
 from .connection import AIOTracedProtocol
-from ...utils.wrappers import unwrap as _u
-from ...ext import sql
+from ..trace_utils import unwrap
 
 
 config._add(
@@ -34,13 +31,13 @@ def _create_pin(tags):
     pin = Pin.get_from(asyncpg)
     db_name = tags.get(db.NAME)
     service = pin.service if pin and pin.service else "postgres_%s" % db_name if db_name else "postgres"
-    app = pin.app if pin and pin.app else "postgres"
+    # Note: Pin object does not have app and app_type attribute anymore
     tracer = pin.tracer if pin else None
 
     if pin and pin.tags:
         tags = {**tags, **pin.tags}  # noqa: E999
 
-    return Pin(service=service, app=app, app_type=sql.APP_TYPE, tags=tags, tracer=tracer)
+    return Pin(service=service, tags=tags, tracer=tracer)
 
 
 def protocol_factory(protocol_cls, *args, **kwargs):
@@ -82,9 +79,8 @@ async def _patched_connect(connect_func, _, args, kwargs):
         conn = await connect_func(*args, **kwargs)
         return conn
 
-    with pin.tracer.trace((pin.app or "sql") + ".connect", service=pin.service) as s:
-        s.span_type = sql.TYPE
-        s.set_tags(pin.tags)
+    with pin.tracer.trace("postgres.connect", span_type=SpanTypes.SQL, service=pin.service) as span:
+        span.set_tags(pin.tags)
 
         conn = await connect_func(*args, **kwargs)
 
@@ -154,9 +150,8 @@ async def _patched_acquire(acquire_func, instance, args, kwargs):
         conn = await acquire_func(*args, **kwargs)
         return conn
 
-    with pin.tracer.trace((pin.app or "sql") + ".pool.acquire", service=pin.service) as s:
-        s.span_type = sql.TYPE
-        s.set_tags(pin.tags)
+    with pin.tracer.trace("postgres.pool.acquire", span_type=SpanTypes.SQL, service=pin.service) as span:
+        span.set_tags(pin.tags)
         conn = await acquire_func(*args, **kwargs)
 
     return conn
@@ -177,9 +172,8 @@ async def _patched_release(release_func, instance, args, kwargs):
         conn = await release_func(*args, **kwargs)
         return conn
 
-    with pin.tracer.trace((pin.app or "sql") + ".pool.release", service=pin.service) as s:
-        s.span_type = sql.TYPE
-        s.set_tags(pin.tags)
+    with pin.tracer.trace("postgres.pool.release", span_type=SpanTypes.SQL, service=pin.service) as span:
+        span.set_tags(pin.tags)
 
         conn = await release_func(*args, **kwargs)
 
@@ -210,9 +204,9 @@ def patch():
 def unpatch():
     if getattr(asyncpg, "_datadog_patch", False):
         setattr(asyncpg, "_datadog_patch", False)
-        _u(asyncpg.connect_utils, "_connect_addr")
-        _u(asyncpg.pool.Pool, "_acquire")
-        _u(asyncpg.pool.Pool, "release")
+        unwrap(asyncpg.connect_utils, "_connect_addr")
+        unwrap(asyncpg.pool.Pool, "_acquire")
+        unwrap(asyncpg.pool.Pool, "release")
 
         # we can't use unwrap because wrapt does a simple attribute replacement
         asyncpg.protocol.Protocol = orig_Protocol

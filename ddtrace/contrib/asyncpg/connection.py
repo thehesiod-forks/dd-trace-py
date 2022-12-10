@@ -1,7 +1,7 @@
-from ...ext import sql
-
 from ddtrace import Pin
 from ddtrace.vendor import wrapt
+
+from ...ext import SpanTypes
 
 
 async def _trace_method(method, pin, trace_name, query, rowcount_method, extra_tags, *args, **kwargs):
@@ -11,8 +11,7 @@ async def _trace_method(method, pin, trace_name, query, rowcount_method, extra_t
 
     service = pin.service
 
-    with pin.tracer.trace(trace_name, service=service, resource=query) as s:
-        s.span_type = sql.TYPE
+    with pin.tracer.trace(trace_name, span_type=SpanTypes.SQL, service=service, resource=query) as s:
         s.set_tags(pin.tags)
         s.set_tags(extra_tags)
 
